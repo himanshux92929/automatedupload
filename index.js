@@ -1,4 +1,4 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const express = require('express');
 const cron = require('node-cron');
@@ -12,16 +12,13 @@ const { getDatabase, ref, set, get, child } = require('firebase/database');
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const ADMIN_ID = "7380969878"; // Your ID for Logs
 const TARGET_BATCH_ID = "40589"; 
 
-// --- SCHEDULING CONFIGURATION ---
-// Format: "Minute Hour DayOfMonth Month DayOfWeek"
-// Examples:
-// '0 */12 * * *' = Every 12 hours (Current Setting)
-// '0 * * * *'    = Every 1 hour
-// '0 0 * * *'    = Every day at midnight
-// '*/30 * * * *' = Every 30 minutes
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 */12 * * *'; 
+// --- SCHEDULING (Midnight IST) ---
+// Server time is usually UTC. Midnight IST (00:00) is 18:30 UTC (previous day).
+// Cron: Minute(30) Hour(18) * * *
+const CRON_SCHEDULE = '30 18 * * *'; 
 
 const firebaseConfig = {
     apiKey: process.env.FIREBASE_API_KEY,
@@ -38,7 +35,7 @@ const API_HOST = "https://theeduverse.xyz";
 const CONTENT_TYPES = ['lectures', 'notes', 'dpps'];
 
 // ==========================================
-// 2. SETUP
+// 2. SETUP & HELPERS
 // ==========================================
 
 const app = express();
@@ -46,13 +43,42 @@ const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
 const bot = new Telegraf(BOT_TOKEN);
 
-// Helper: Proxy URL Generator
+// --- A. Robust Logger (Sends to You) ---
+const logToAdmin = async (message) => {
+    console.log(message); // Keep server log for backup
+    try {
+        await bot.telegram.sendMessage(ADMIN_ID, `⚙️ **Log:** ${message}`, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.error("Failed to send log to admin:", e.message);
+    }
+};
+
+// --- B. Font Beautifier (Math Bold Italic) ---
+const toMathBoldItalic = (text) => {
+    const map = {
+        'A': '𝑨', 'B': '𝑩', 'C': '𝑪', 'D': '𝑫', 'E': '𝑬', 'F': '𝑭', 'G': '𝑮', 'H': '𝑯', 'I': '𝑰', 'J': '𝑱', 'K': '𝑲', 'L': '𝑳', 'M': '𝑴', 'N': '𝑵', 'O': '𝑶', 'P': '𝑷', 'Q': '𝑸', 'R': '𝑹', 'S': '𝑺', 'T': '𝑻', 'U': '𝑼', 'V': '𝑽', 'W': '𝑾', 'X': '𝑿', 'Y': '𝒀', 'Z': '𝒁',
+        'a': '𝒂', 'b': '𝒃', 'c': '𝒄', 'd': '𝒅', 'e': '𝒆', 'f': '𝒇', 'g': '𝒈', 'h': '𝒉', 'i': '𝒊', 'j': '𝒋', 'k': '𝒌', 'l': '𝒍', 'm': '𝒎', 'n': '𝒏', 'o': '𝒐', 'p': '𝒑', 'q': '𝒒', 'r': '𝒓', 's': '𝒔', 't': '𝒕', 'u': '𝒖', 'v': '𝒗', 'w': '𝒘', 'x': '𝒙', 'y': '𝒚', 'z': '𝒛'
+    };
+    return text.split('').map(char => map[char] || char).join('');
+};
+
+// --- C. Retry Fetcher (Prevents Timeout Crash) ---
+const fetchWithRetry = async (url, retries = 3) => {
+    for (let i = 0; i < retries; i++) {
+        try {
+            return await axios.get(url, { timeout: 10000 }); // 10s timeout
+        } catch (err) {
+            if (i === retries - 1) throw err; // Throw if last attempt fails
+            await new Promise(r => setTimeout(r, 5000)); // Wait 5s before retry
+        }
+    }
+};
+
 const getApiUrl = (path) => {
     const target = `${API_HOST}/api${path}`;
     return `${PROXY_BASE}?url=${encodeURIComponent(target)}&referrer=${encodeURIComponent(API_HOST)}`;
 };
 
-// Helper: Format Link
 const formatLink = (title, rawUrl) => {
     let finalUrl = rawUrl;
     if (/\/(\d+)_(\d+)\.m3u8$/.test(finalUrl)) {
@@ -64,124 +90,126 @@ const formatLink = (title, rawUrl) => {
     return finalUrl;
 };
 
-// Helper: Delay to prevent Rate Limiting (Crucial when sending many items)
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Helper: Capitalize
-const capitalize = (s) => s && s[0].toUpperCase() + s.slice(1);
-
 // ==========================================
 // 3. AUTOMATION LOGIC
 // ==========================================
 
 const runUpdateCycle = async () => {
-    // Log to server console only, not Telegram
-    console.log(`[${new Date().toISOString()}] Starting 12-Hour Update Cycle...`);
+    await logToAdmin(`🚀 **Update Cycle Started**`);
 
     try {
-        // --- A. Fetch Already Completed Items from DB ---
+        // 1. Fetch Completed Items
         const dbRef = ref(db);
         const snapshot = await get(child(dbRef, `completed_items`));
         const completedMap = snapshot.exists() ? snapshot.val() : {};
 
-        // --- B. Fetch Subjects ---
-        const subRes = await axios.get(getApiUrl(`/batches/${TARGET_BATCH_ID}`));
-        const subjects = subRes.data.data || [];
-        
-        console.log(`Found ${subjects.length} subjects. Scanning for content...`);
+        // 2. Fetch Subjects (With Retry)
+        let subjects = [];
+        try {
+            const subRes = await fetchWithRetry(getApiUrl(`/batches/${TARGET_BATCH_ID}`));
+            subjects = subRes.data.data || [];
+        } catch (err) {
+            await logToAdmin(`❌ Critical: Failed to fetch subjects. ${err.message}`);
+            return;
+        }
 
-        // --- C. Iterate Through Everything (Subjects -> Types -> Items) ---
+        let newItemsCount = 0;
+
+        // 3. Process Loops
         for (const subject of subjects) {
             for (const type of CONTENT_TYPES) {
                 
-                // Fetch content
-                const contentUrl = getApiUrl(`/${TARGET_BATCH_ID}/subjects/${subject.id}/${type}`);
+                // Fetch Content (With Retry & Try-Catch so loop doesn't break)
                 let allItems = [];
-
                 try {
-                    const contentRes = await axios.get(contentUrl);
+                    const contentUrl = getApiUrl(`/${TARGET_BATCH_ID}/subjects/${subject.id}/${type}`);
+                    const contentRes = await fetchWithRetry(contentUrl);
                     allItems = contentRes.data.data || [];
                 } catch (err) {
-                    console.error(`Error fetching ${subject.name} - ${type}:`, err.message);
+                    // Log error but CONTINUE to next type/subject
+                    await logToAdmin(`⚠️ Skip: ${subject.name} (${type}) failed. ${err.message}`);
                     continue; 
                 }
 
-                // Filter for pending items
                 const pendingItems = allItems.filter(item => !completedMap[item.id]);
 
                 if (pendingItems.length > 0) {
-                    console.log(`> Processing ${pendingItems.length} new ${type} for ${subject.name}`);
                     
-                    // --- D. Send ALL Pending Items ---
                     for (const item of pendingItems) {
-                        const title = item.title || item.name || 'Untitled';
-                        const rawUrl = item.url || item.originalUrl || item.baseUrl;
-                        const finalLink = formatLink(title, rawUrl);
-                        const typeLabel = capitalize(type).replace(/s$/, ''); 
-
-                        // 1. Construct Message
-                        const message = 
-                            `📌 **${title}**\n` +
-                            `📚 **Subject:** ${subject.name}\n` +
-                            `📂 **Type:** ${typeLabel}\n\n` +
-                            `🔗 [Click to Open](${finalLink})`;
-
                         try {
-                            // 2. Send to Channel
-                            await bot.telegram.sendMessage(CHANNEL_ID, message, { 
-                                parse_mode: 'Markdown',
-                                disable_web_page_preview: true 
+                            const title = item.title || item.name || 'Untitled';
+                            const rawUrl = item.url || item.originalUrl || item.baseUrl;
+                            const finalLink = formatLink(title, rawUrl);
+                            
+                            // Beautify Text
+                            const subjectStyled = toMathBoldItalic(subject.name);
+                            const topicStyled = toMathBoldItalic(title);
+                            
+                            let typeLabel = "Unknown";
+                            let buttonText = "Open Link";
+
+                            if (type === 'lectures') { typeLabel = "Lecture"; buttonText = "📺 Watch Lecture"; }
+                            if (type === 'notes') { typeLabel = "Notes"; buttonText = "📄 Open Notes"; }
+                            if (type === 'dpps') { typeLabel = "DPP"; buttonText = "📝 Open DPP"; }
+
+                            // Construct Message (The Design You Asked For)
+                            const message = 
+`${subjectStyled}
+_________________
+
+Topic :- ${topicStyled}
+Type :- ${typeLabel}
+_________________`;
+
+                            // Send to Channel with Button
+                            await bot.telegram.sendMessage(CHANNEL_ID, message, {
+                                ...Markup.inlineKeyboard([
+                                    [Markup.button.url(buttonText, finalLink)]
+                                ])
                             });
 
-                            // 3. Mark as Done in Firebase
+                            // Save to DB
                             await set(ref(db, 'completed_items/' + item.id), true);
+                            newItemsCount++;
                             
-                            // 4. Rate Limit Delay (2 seconds is safe for bulk sending)
-                            await delay(2000); 
+                            // Delay to respect rate limits
+                            await new Promise(r => setTimeout(r, 2000));
 
                         } catch (sendErr) {
-                            console.error(`Failed to send item ${item.id}:`, sendErr.message);
-                            // If Telegram fails, we don't mark as done so it retries next time
+                            await logToAdmin(`❌ Error sending ${item.id}: ${sendErr.message}`);
                         }
                     }
                 }
             }
         }
-        console.log(`[${new Date().toISOString()}] Cycle Completed Successfully.`);
+        await logToAdmin(`✅ **Cycle Finished.** Uploaded: ${newItemsCount} items.`);
 
     } catch (e) {
-        console.error("Critical Error in Update Cycle:", e);
+        await logToAdmin(`💀 **CRITICAL SYSTEM FAILURE:** ${e.message}`);
     }
 };
 
 // ==========================================
-// 4. SCHEDULER
+// 4. SCHEDULER & COMMANDS
 // ==========================================
 
-console.log(`Initializing Scheduler with schedule: ${CRON_SCHEDULE}`);
-
-// Schedule the task based on the config variable
+// Midnight IST = 18:30 UTC
 cron.schedule(CRON_SCHEDULE, () => {
     runUpdateCycle();
 });
 
-// ==========================================
-// 5. SERVER & INIT
-// ==========================================
-
-// Manual Trigger for Admin (Private Chat Only - No Channel Logs)
+// Force Update Command
 bot.command('force_update', async (ctx) => {
-    ctx.reply("🔄 checking for updates..."); // Private reply only
+    if (ctx.from.id.toString() !== ADMIN_ID) return; // Security Check
+    ctx.reply("🔄 Force update initialized...");
     await runUpdateCycle();
-    ctx.reply("✅ Check complete."); // Private reply only
 });
 
 bot.launch();
 
-// Keep the server alive
+// Server Keep-Alive
 app.get('/', (req, res) => res.send('Bot is Running 🟢'));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-// Graceful Stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
