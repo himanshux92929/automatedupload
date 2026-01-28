@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const ADMIN_ID = "7380969878"; // Your ID for Logs
-const TARGET_BATCH_ID = "40589"; 
+const TARGET_BATCH_ID = "40693"; 
 
 // --- SCHEDULING (Midnight IST) ---
 // Server time is usually UTC. Midnight IST (00:00) is 18:30 UTC (previous day).
